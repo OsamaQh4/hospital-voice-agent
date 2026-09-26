@@ -1,0 +1,21 @@
+name = "hospital-webhook"
+main = "src/index.ts"
+compatibility_date = "2026-05-01"
+
+[telnyx]
+binding = "telnyx"
+
+[[secrets]]
+binding = "TELNYX_PUBLIC_KEY"
+name = "TELNYX_PUBLIC_KEY"
+
+[[actors]]
+binding = "PATIENT"
+type = "PatientActor"
+
+[storage.kv.DEPARTMENT_KV]
+id = "176fe6e5-d42d-47ec-8ae1-47f93478e0d4"
+
+[edge_compute]
+func_id = "509f0341-599c-48b3-9ed7-24f176535d71"
+func_name = "hospital-webhook"

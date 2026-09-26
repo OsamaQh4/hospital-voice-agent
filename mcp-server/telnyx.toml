@@ -1,0 +1,21 @@
+name = "hospital-mcp-server"
+main = "src/index.ts"
+compatibility_date = "2026-05-01"
+
+[telnyx]
+binding = "telnyx"
+
+[[secrets]]
+binding = "HOSPITAL_SMS_FROM_NUMBER"
+name = "HOSPITAL_SMS_FROM_NUMBER"
+
+[[actors]]
+binding = "PATIENT"
+type = "PatientActor"
+
+[storage.kv.DEPARTMENT_KV]
+id = "176fe6e5-d42d-47ec-8ae1-47f93478e0d4"
+
+[edge_compute]
+func_id = "eeef475f-1438-4f45-863b-498b62b240ac"
+func_name = "hospital-mcp-server"
