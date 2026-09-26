@@ -1,0 +1,453 @@
+{
+  "_design_notes": {
+    "purpose": "Architecture blueprint for the hospital multi-department appointments assistant. Built and edited live in the Portal's Conversation Workflow canvas -- this file is the reference/reviewable form of that graph, not a payload verified to import byte-for-byte via the API.",
+    "schema_source": "Node shape (prompt/speak/tool, instructions_mode, message), edge shape ({id, start_node_id, target:{type,node_id}, condition}), and condition types (llm / expression-comparison / default) verified against https://developers.telnyx.com/docs/inference/ai-assistants/workflows on 2026-09-25.",
+    "unverified_field": "tool_name on tool nodes and tools (per-node tool scoping) on prompt/tool nodes are our best-effort naming -- the docs describe per-node tool scoping only as a Portal UI feature, not at the JSON-field level. In the Portal these are set via dropdowns (MCP server -> tool) and a per-node tool checklist, not hand-typed.",
+    "department_as_parameter": "General Medicine, Pediatrics, and Dental are NOT three parallel subtrees. Every booking-path tool call takes `department` as an argument (get_available_slots, book_appointment), so the graph has one shape for 'new booking' and one for 'reschedule', not one per department. This is what get_available_slots/book_appointment being parameterized buys, even though n_get_slots_new/n_get_slots_reschedule and n_offer_slots_new/n_offer_slots_reschedule stay as two thin node pairs -- Telnyx tool nodes route on a fixed next node, so one get_slots call site can't serve two different static next-node targets no matter how the tool itself is parameterized. Documented here rather than glossed over.",
+    "emergency_edge_scope": "The emergency-language LLM edge is checked FIRST on exactly two nodes: n_identify_intent (every call passes through it) and n_admin_faq (the one other node open-ended enough for a caller to raise something urgent mid-question). It is not wired onto every prompt node -- an honest, stated limitation, not a hidden gap. See README Safety net."
+  },
+  "start_node_id": "n_disclosure",
+  "nodes": [
+    {
+      "id": "n_disclosure",
+      "type": "speak",
+      "name": "Disclosure",
+      "message": "Thank you for calling. This call may be recorded for quality and training purposes. I'm an AI assistant and I can help you book, reschedule, or cancel an appointment, or answer general questions about our departments and hours. If this is a medical emergency, please hang up now and dial 9-9-7."
+    },
+    {
+      "id": "n_identify_intent",
+      "type": "prompt",
+      "name": "Identify Intent",
+      "instructions_mode": "append",
+      "instructions": "Determine why the caller is calling: booking/rescheduling/cancelling an appointment, a general administrative question, or a medical emergency. Do not attempt to answer clinical/medical questions yourself -- this assistant handles administrative scheduling and general information only.",
+      "tools": []
+    },
+    {
+      "id": "n_emergency_escalation",
+      "type": "speak",
+      "name": "Emergency Escalation",
+      "message": "This line is for scheduling and general information only, and isn't monitored for emergencies. If this is a medical emergency, please hang up right now and dial 9-9-7 for immediate help."
+    },
+    {
+      "id": "n_existing_appointment_check",
+      "type": "prompt",
+      "name": "Existing Appointment Check",
+      "instructions_mode": "append",
+      "instructions": "The caller has an existing appointment on file: {{existing_appointment_department}} at {{existing_appointment_time}}. Confirm what they want to do with it: reschedule it, cancel it, or something else (e.g. they actually want a separate, additional appointment).",
+      "tools": []
+    },
+    {
+      "id": "n_select_department",
+      "type": "prompt",
+      "name": "Select Department",
+      "instructions_mode": "append",
+      "instructions": "Ask which department the appointment is for: General Medicine, Pediatrics, or Dental. Available departments: {{department_list}}. If the caller describes symptoms instead of naming a department, suggest the closest matching department rather than diagnosing them.",
+      "tools": []
+    },
+    {
+      "id": "n_collect_name",
+      "type": "prompt",
+      "name": "Collect Name",
+      "instructions_mode": "append",
+      "instructions": "Ask for the patient's full name as it should appear on the appointment, unless we already have one on file ({{patient_full_name}}) and the caller confirms it's still correct.",
+      "tools": []
+    },
+    {
+      "id": "n_get_slots_new",
+      "type": "tool",
+      "name": "Get Available Slots (New Booking)",
+      "tool_name": "get_available_slots",
+      "message": "One moment while I check available times."
+    },
+    {
+      "id": "n_get_slots_reschedule",
+      "type": "tool",
+      "name": "Get Available Slots (Reschedule)",
+      "tool_name": "get_available_slots",
+      "message": "One moment while I check other available times."
+    },
+    {
+      "id": "n_offer_slots_new",
+      "type": "prompt",
+      "name": "Offer Slots (New Booking)",
+      "instructions_mode": "append",
+      "instructions": "Read the caller 2-3 of the returned slot options for the chosen department and ask them to pick one. If none work, offer to check a later date.",
+      "tools": []
+    },
+    {
+      "id": "n_offer_slots_reschedule",
+      "type": "prompt",
+      "name": "Offer Slots (Reschedule)",
+      "instructions_mode": "append",
+      "instructions": "Read the caller 2-3 of the returned slot options for their existing department ({{existing_appointment_department}}) and ask them to pick one as the new time for their appointment.",
+      "tools": []
+    },
+    {
+      "id": "n_confirm_booking",
+      "type": "tool",
+      "name": "Book Appointment",
+      "tool_name": "book_appointment",
+      "message": "Booking that appointment now."
+    },
+    {
+      "id": "n_confirm_reschedule",
+      "type": "tool",
+      "name": "Reschedule Appointment",
+      "tool_name": "reschedule_or_cancel_appointment",
+      "message": "Updating your appointment now."
+    },
+    {
+      "id": "n_confirm_cancellation",
+      "type": "tool",
+      "name": "Cancel Appointment",
+      "tool_name": "reschedule_or_cancel_appointment",
+      "message": "Cancelling that appointment now."
+    },
+    {
+      "id": "n_send_confirmation_sms",
+      "type": "tool",
+      "name": "Send Confirmation SMS",
+      "tool_name": "send_appointment_confirmation_sms",
+      "message": "Sending you a text confirmation."
+    },
+    {
+      "id": "n_booking_confirmed",
+      "type": "speak",
+      "name": "Booking Confirmed",
+      "message": "You're all set -- your appointment is confirmed, and I've sent a text confirmation to this number. Is there anything else I can help with?"
+    },
+    {
+      "id": "n_cancellation_confirmed",
+      "type": "speak",
+      "name": "Cancellation Confirmed",
+      "message": "Your appointment has been cancelled. Is there anything else I can help with?"
+    },
+    {
+      "id": "n_admin_faq",
+      "type": "prompt",
+      "name": "Admin FAQ",
+      "instructions_mode": "append",
+      "instructions": "Answer general administrative questions only: hours, locations, parking, insurance/billing office contact, what to bring to an appointment, walk-in policy per department. Do not answer clinical/medical questions -- offer to connect them to book an appointment instead, or direct them to speak with clinical staff.",
+      "tools": []
+    },
+    {
+      "id": "n_anything_else",
+      "type": "prompt",
+      "name": "Anything Else",
+      "instructions_mode": "append",
+      "instructions": "Ask if there's anything else the caller needs before ending the call.",
+      "tools": []
+    },
+    {
+      "id": "n_technical_issue",
+      "type": "speak",
+      "name": "Technical Issue",
+      "message": "I'm sorry, I'm having trouble completing that right now. Please call back in a few minutes, or I can have our scheduling team call you back."
+    },
+    {
+      "id": "n_close_call",
+      "type": "tool",
+      "name": "Close Call",
+      "tool_name": "hangup",
+      "message": "Thank you for calling. Goodbye.",
+      "_note": "The built-in hangup tool node: ends the call and accepts no outgoing edges (unlike a speak node, which must have exactly one default edge). Verified against https://developers.telnyx.com/docs/inference/ai-assistants/workflows on 2026-09-25 -- 'A hangup tool node ends the call; it accepts no outgoing edges.'"
+    }
+  ],
+  "edges": [
+    {
+      "id": "e_disclosure_default",
+      "start_node_id": "n_disclosure",
+      "target": { "type": "node", "node_id": "n_identify_intent" },
+      "condition": { "type": "default" }
+    },
+    {
+      "id": "e_intent_emergency",
+      "start_node_id": "n_identify_intent",
+      "priority": 1,
+      "target": { "type": "node", "node_id": "n_emergency_escalation" },
+      "condition": {
+        "type": "llm",
+        "prompt": "The caller describes a medical emergency or urgent/serious symptom needing immediate attention."
+      }
+    },
+    {
+      "id": "e_intent_repeat_with_appointment",
+      "start_node_id": "n_identify_intent",
+      "priority": 2,
+      "target": { "type": "node", "node_id": "n_existing_appointment_check" },
+      "condition": {
+        "type": "expression",
+        "expression": {
+          "type": "logical_and",
+          "operands": [
+            {
+              "type": "comparison",
+              "op": "==",
+              "left": { "type": "variable", "name": "is_repeat_caller" },
+              "right": { "type": "string_literal", "value": "true" }
+            },
+            {
+              "type": "comparison",
+              "op": "==",
+              "left": { "type": "variable", "name": "has_existing_appointment" },
+              "right": { "type": "string_literal", "value": "true" }
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "e_intent_book",
+      "start_node_id": "n_identify_intent",
+      "priority": 3,
+      "target": { "type": "node", "node_id": "n_select_department" },
+      "condition": {
+        "type": "llm",
+        "prompt": "The caller wants to book a new appointment."
+      }
+    },
+    {
+      "id": "e_intent_general_question",
+      "start_node_id": "n_identify_intent",
+      "priority": 4,
+      "target": { "type": "node", "node_id": "n_admin_faq" },
+      "condition": {
+        "type": "llm",
+        "prompt": "The caller has a general administrative question (hours, location, billing, what to bring, etc.)."
+      }
+    },
+    {
+      "id": "e_intent_default",
+      "start_node_id": "n_identify_intent",
+      "target": { "type": "node", "node_id": "n_admin_faq" },
+      "condition": { "type": "default" }
+    },
+    {
+      "id": "e_emergency_default",
+      "start_node_id": "n_emergency_escalation",
+      "target": { "type": "node", "node_id": "n_close_call" },
+      "condition": { "type": "default" }
+    },
+    {
+      "id": "e_existing_reschedule",
+      "start_node_id": "n_existing_appointment_check",
+      "priority": 1,
+      "target": { "type": "node", "node_id": "n_get_slots_reschedule" },
+      "condition": {
+        "type": "llm",
+        "prompt": "The caller wants to reschedule their existing appointment to a different time."
+      }
+    },
+    {
+      "id": "e_existing_cancel",
+      "start_node_id": "n_existing_appointment_check",
+      "priority": 2,
+      "target": { "type": "node", "node_id": "n_confirm_cancellation" },
+      "condition": {
+        "type": "llm",
+        "prompt": "The caller wants to cancel their existing appointment."
+      }
+    },
+    {
+      "id": "e_existing_default",
+      "start_node_id": "n_existing_appointment_check",
+      "target": { "type": "node", "node_id": "n_close_call" },
+      "condition": { "type": "default" }
+    },
+    {
+      "id": "e_select_department_default",
+      "start_node_id": "n_select_department",
+      "target": { "type": "node", "node_id": "n_collect_name" },
+      "condition": { "type": "default" }
+    },
+    {
+      "id": "e_collect_name_default",
+      "start_node_id": "n_collect_name",
+      "target": { "type": "node", "node_id": "n_get_slots_new" },
+      "condition": { "type": "default" }
+    },
+    {
+      "id": "e_get_slots_new_success",
+      "start_node_id": "n_get_slots_new",
+      "priority": 1,
+      "target": { "type": "node", "node_id": "n_offer_slots_new" },
+      "condition": {
+        "type": "expression",
+        "expression": {
+          "type": "comparison",
+          "op": "==",
+          "left": { "type": "variable", "name": "telnyx_last_tool_status_code" },
+          "right": { "type": "string_literal", "value": "200" }
+        }
+      }
+    },
+    {
+      "id": "e_get_slots_new_failure",
+      "start_node_id": "n_get_slots_new",
+      "target": { "type": "node", "node_id": "n_technical_issue" },
+      "condition": { "type": "default" }
+    },
+    {
+      "id": "e_get_slots_reschedule_success",
+      "start_node_id": "n_get_slots_reschedule",
+      "priority": 1,
+      "target": { "type": "node", "node_id": "n_offer_slots_reschedule" },
+      "condition": {
+        "type": "expression",
+        "expression": {
+          "type": "comparison",
+          "op": "==",
+          "left": { "type": "variable", "name": "telnyx_last_tool_status_code" },
+          "right": { "type": "string_literal", "value": "200" }
+        }
+      }
+    },
+    {
+      "id": "e_get_slots_reschedule_failure",
+      "start_node_id": "n_get_slots_reschedule",
+      "target": { "type": "node", "node_id": "n_technical_issue" },
+      "condition": { "type": "default" }
+    },
+    {
+      "id": "e_offer_slots_new_default",
+      "start_node_id": "n_offer_slots_new",
+      "target": { "type": "node", "node_id": "n_confirm_booking" },
+      "condition": { "type": "default" }
+    },
+    {
+      "id": "e_offer_slots_reschedule_default",
+      "start_node_id": "n_offer_slots_reschedule",
+      "target": { "type": "node", "node_id": "n_confirm_reschedule" },
+      "condition": { "type": "default" }
+    },
+    {
+      "id": "e_confirm_booking_success",
+      "start_node_id": "n_confirm_booking",
+      "priority": 1,
+      "target": { "type": "node", "node_id": "n_send_confirmation_sms" },
+      "condition": {
+        "type": "expression",
+        "expression": {
+          "type": "comparison",
+          "op": "==",
+          "left": { "type": "variable", "name": "telnyx_last_tool_status_code" },
+          "right": { "type": "string_literal", "value": "200" }
+        }
+      }
+    },
+    {
+      "id": "e_confirm_booking_failure",
+      "start_node_id": "n_confirm_booking",
+      "target": { "type": "node", "node_id": "n_technical_issue" },
+      "condition": { "type": "default" }
+    },
+    {
+      "id": "e_confirm_reschedule_success",
+      "start_node_id": "n_confirm_reschedule",
+      "priority": 1,
+      "target": { "type": "node", "node_id": "n_send_confirmation_sms" },
+      "condition": {
+        "type": "expression",
+        "expression": {
+          "type": "comparison",
+          "op": "==",
+          "left": { "type": "variable", "name": "telnyx_last_tool_status_code" },
+          "right": { "type": "string_literal", "value": "200" }
+        }
+      }
+    },
+    {
+      "id": "e_confirm_reschedule_failure",
+      "start_node_id": "n_confirm_reschedule",
+      "target": { "type": "node", "node_id": "n_technical_issue" },
+      "condition": { "type": "default" }
+    },
+    {
+      "id": "e_confirm_cancellation_success",
+      "start_node_id": "n_confirm_cancellation",
+      "priority": 1,
+      "target": { "type": "node", "node_id": "n_cancellation_confirmed" },
+      "condition": {
+        "type": "expression",
+        "expression": {
+          "type": "comparison",
+          "op": "==",
+          "left": { "type": "variable", "name": "telnyx_last_tool_status_code" },
+          "right": { "type": "string_literal", "value": "200" }
+        }
+      }
+    },
+    {
+      "id": "e_confirm_cancellation_failure",
+      "start_node_id": "n_confirm_cancellation",
+      "target": { "type": "node", "node_id": "n_technical_issue" },
+      "condition": { "type": "default" }
+    },
+    {
+      "id": "e_send_confirmation_sms_default",
+      "start_node_id": "n_send_confirmation_sms",
+      "target": { "type": "node", "node_id": "n_booking_confirmed" },
+      "condition": { "type": "default" }
+    },
+    {
+      "id": "e_booking_confirmed_default",
+      "start_node_id": "n_booking_confirmed",
+      "target": { "type": "node", "node_id": "n_anything_else" },
+      "condition": { "type": "default" }
+    },
+    {
+      "id": "e_cancellation_confirmed_default",
+      "start_node_id": "n_cancellation_confirmed",
+      "target": { "type": "node", "node_id": "n_anything_else" },
+      "condition": { "type": "default" }
+    },
+    {
+      "id": "e_admin_faq_emergency",
+      "start_node_id": "n_admin_faq",
+      "priority": 1,
+      "target": { "type": "node", "node_id": "n_emergency_escalation" },
+      "condition": {
+        "type": "llm",
+        "prompt": "The caller describes a medical emergency or urgent/serious symptom needing immediate attention."
+      }
+    },
+    {
+      "id": "e_admin_faq_book",
+      "start_node_id": "n_admin_faq",
+      "priority": 2,
+      "target": { "type": "node", "node_id": "n_select_department" },
+      "condition": {
+        "type": "llm",
+        "prompt": "The caller wants to book an appointment."
+      }
+    },
+    {
+      "id": "e_admin_faq_default",
+      "start_node_id": "n_admin_faq",
+      "target": { "type": "node", "node_id": "n_anything_else" },
+      "condition": { "type": "default" }
+    },
+    {
+      "id": "e_anything_else_more",
+      "start_node_id": "n_anything_else",
+      "priority": 1,
+      "target": { "type": "node", "node_id": "n_identify_intent" },
+      "condition": {
+        "type": "llm",
+        "prompt": "The caller has another request (booking, rescheduling, cancelling, or a new question)."
+      }
+    },
+    {
+      "id": "e_anything_else_default",
+      "start_node_id": "n_anything_else",
+      "target": { "type": "node", "node_id": "n_close_call" },
+      "condition": { "type": "default" }
+    },
+    {
+      "id": "e_technical_issue_default",
+      "start_node_id": "n_technical_issue",
+      "target": { "type": "node", "node_id": "n_close_call" },
+      "condition": { "type": "default" }
+    }
+  ]
+}
