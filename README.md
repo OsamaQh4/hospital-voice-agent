@@ -1,445 +1,313 @@
 # Hospital Appointments Voice Assistant
 
-A Telnyx AI Assistant that answers a hospital's main line in Arabic and
-English (mid-call code-switching), and handles **administrative** scheduling
-across three departments -- General Medicine, Pediatrics, and Dental:
-booking, rescheduling, cancelling, and general FAQ (hours, location,
-billing, what to bring). It does not answer clinical/medical questions and
-it is not an emergency line -- both are stated up front and enforced in the
-workflow (see "Safety net" below).
+A Telnyx AI Assistant that answers a hospital's phone line and handles
+administrative scheduling for three departments: General Medicine,
+Pediatrics, and Dental. Callers can check, book, reschedule, or cancel an
+appointment, get an SMS confirmation, and ask general questions about the
+departments. It gives no medical advice, and it directs emergencies to 997.
 
-Built for the Telnyx Forward Deployed Engineer take-home. This repo is the
-rebuilt, hospital/multi-department version of an earlier HR-screening
-prototype (same architecture, different domain) -- see "Design history"
-at the bottom for why it changed.
+**Call it: +1 512 316 0965**
 
-## Architecture
+Built for the Telnyx Forward Deployed Engineer take-home.
+
+## How it works
 
 ```
-                         ┌─────────────────────────┐
-   PSTN call ──────────► │  Telnyx AI Assistant      │
-                         │  (Conversation Workflow)  │
-                         └─────────┬─────────┬───────┘
-                                   │         │
-                    dynamic_variables_webhook_url   mcp_servers
-                          (call start only)     (throughout the call)
-                                   │         │
-                                   ▼         ▼
-                    ┌──────────────────┐   ┌─────────────────────┐
-                    │ webhook-function  │   │   mcp-server          │
-                    │ (Edge Function)   │   │  (Edge Function,      │
-                    │                   │   │   Streamable HTTP MCP)│
-                    └─────────┬─────────┘   └──────────┬───────────┘
-                              │                          │
-                     idFromName(phone) ────────┬──────── idFromName(phone)
-                              │                 │
-                              ▼                 ▼
-                    ┌───────────────────────────────────┐
-                    │   PatientActor (Stateful Actor)     │
-                    │   one instance per phone number      │
-                    │   -- Shared Actor: class shipped by  │
-                    │      webhook-function, reused by      │
-                    │      mcp-server via a type-only       │
-                    │      import + matching telnyx.toml    │
-                    │      `type`                            │
-                    └───────────────────────────────────┘
-                              │
-                              ▼
-                    ┌───────────────────────────────────┐
-                    │  DEPARTMENT_KV                       │
-                    │  - department directory (cache)      │
-                    │  - SAME_DAY_SLOTS_ENABLED flag        │
-                    └───────────────────────────────────┘
+  Caller ──► Telnyx AI Assistant  (Kimi K2.6, conversation flow, Telnyx voice)
+                 │                               │
+     at call start: dynamic variables   during the call: MCP tools
+                 │                               │
+                 ▼                               ▼
+      hospital-webhook-v2              hospital-mcp-v2
+      (Edge Function)                  (Edge Function, MCP over HTTP)
+                 │                               │
+                 └───────────────┬───────────────┘
+                                 ▼
+                     Patient records, per phone number
+                     PatientActorV2 (Stateful Actor)
+                     or KV, chosen by PATIENT_BACKEND
+                                 │
+                 DEPARTMENT_KV: department directory, same-day-slots flag
+                 Telnyx Messaging: confirmation SMS
 ```
 
-Two independently-deployed Edge Functions, one shared durable actor type,
-one KV namespace. `telnyx.messages.send` (via the pre-authenticated
-`[telnyx]` binding) sends confirmation SMS; `telnyx.webhooks.unwrap`
-verifies the dynamic-variables webhook's Ed25519 signature.
+- **`webhook-function`** (`hospital-webhook-v2`) runs once at call start.
+  It verifies the request's Ed25519 signature (`telnyx.webhooks.unwrap`),
+  records the call against the caller's number, and returns dynamic
+  variables to the assistant: `patient_full_name`, `is_repeat_caller`,
+  `has_existing_appointment`, `existing_appointment_department`,
+  `existing_appointment_time`, `department_list`, `same_day_slots_enabled`,
+  and `correlation_id`. It also ships the `PatientActorV2` class.
+- **`mcp-server`** (`hospital-mcp-v2`) exposes the tools the assistant calls
+  during the conversation. It references the same actor type without
+  shipping the class (a Shared Actor).
+- Both functions read and write patient records through one module,
+  `webhook-function/src/lib/patientRecords.ts`.
 
-> **Current state (2026-09-27).** Patient records are temporarily stored in
-> **KV instead of the actor**, behind one switch (`PATIENT_BACKEND` in
-> `webhook-function/src/lib/patientRecords.ts`), because every Stateful
-> Actor call on this Telnyx account started failing on 2026-09-26 -- see
-> "Debugging story". The actor code is unchanged and still deployed
-> (`PatientActorV2`); flipping the switch back to `"actor"` restores the
-> design above. Live functions: `hospital-webhook-v2` and `hospital-mcp-v2`.
+## Patient records: actor, with a KV fallback
 
-## Why Actor / KV / plain logic -- for every piece of state
+Patient records live in a **Stateful Actor**, one instance per phone
+number. Two functions write the same record within one call: the webhook
+at call start, then the tools mid-call. An actor processes one request per
+instance at a time, so "read the appointment, then change it" can never
+lose an update. The phone number is the instance id.
 
-This is the question the challenge grades directly, so it's answered per
-piece of state rather than once in the abstract:
+**Currently running on KV.** Since 2026-09-26, every actor call on this
+Telnyx account fails (see "Incident" below), so records are stored in KV.
+One constant switches both functions:
+
+```ts
+// webhook-function/src/lib/patientRecords.ts
+export const PATIENT_BACKEND: "actor" | "kv" = "kv";
+```
+
+The KV version mirrors the actor method for method, with the same
+validation and the same return shapes, under keys `patient/<id>`. Telnyx KV
+keys allow only `a-z A-Z 0-9 - _ / = .`, so other characters are encoded as
+`=` plus two hex digits: `+966…` becomes `=2b966…`. KV does not serialize
+writes per key, so two writes to the same patient in the same instant can
+lose one. That's acceptable for a demo line, but not for production
+traffic. Once `/health?actor=1` reports the actor healthy, set the switch
+back to `"actor"` and redeploy both functions.
 
 | State | Where | Why |
 |---|---|---|
-| A patient's name, current appointment, call count | **PatientActor** (Stateful Actor), keyed by phone number | Written by *two* independently-deployed projects in the same conversation (the webhook on call start, the MCP tools mid-call), sometimes within a second of each other. An Actor's per-id single-threaded execution makes "read current appointment, then write a changed one" atomic for free. A KV value would need hand-rolled optimistic-concurrency retries to avoid a lost update; a database would need the same, or explicit row locking. The phone number *is* the actor id (`this.ctx.id`), so there's no separate lookup step either. |
-| Department directory (names, referral/walk-in policy) | **KV** (`DEPARTMENT_KV`) | Read on every call, changes rarely (a new department, a policy change), and has no per-caller identity -- the textbook KV cache case. Stale-by-a-few-seconds is fine; there is no "write" contention to protect against. |
-| `SAME_DAY_SLOTS_ENABLED` feature flag | **KV** (`DEPARTMENT_KV`) | Same shape as the directory: global, rarely-written, read-heavy, no serialization need. A KV flag (not a code constant) so ops can turn same-day booking off during a staffing shortage without a redeploy. |
-| Appointment slot availability | **Plain logic** (`nextAvailableSlots` in `mcp-server/src/lib/scheduling.ts`) | Deterministic, stateless, computed from the clock -- there's nothing to persist. A real deployment would call the hospital's practice-management system here instead; that's the one scope cut below, not a state-placement mistake. |
-| Ed25519 webhook public key | **Secret** (`[[secrets]] TELNYX_PUBLIC_KEY`) | A credential, not application state -- belongs in `[[secrets]]`, read via `env.SECRETS.get(...)`, never in KV or code. |
+| Patient name, current appointment, call count | Actor (KV while the actor is unavailable) | Written by two functions in the same call; ordering matters |
+| Department directory | KV (`DEPARTMENT_KV`) | Shared, read on every call, rarely changes |
+| `same_day_slots_enabled` flag | KV (`DEPARTMENT_KV`) | Can be switched without a redeploy |
+| Available slots | Plain code (`mcp-server/src/lib/scheduling.ts`) | Computed from the clock; nothing to store |
+| Webhook public key, SMS sender number | Secrets | Credentials, not application state |
 
-The one-line version: **Actor** when the same record is read-and-written by
-more than one caller in the same conversation and correctness depends on
-ordering; **KV** when it's shared, cache-shaped, and no single caller owns
-it; **plain logic** when there's nothing to persist at all.
+## Conversation flow
 
-While the actor is unavailable, the KV stopgap mirrors `PatientActorV2`
-method for method (same validation, same return shapes), under keys
-`patient/<id>` (non-KV-safe characters such as `+` are written as `=2b`).
-It gives up exactly what the table above says the actor buys: two writes to
-the same patient in the same instant can lose one, and a write can take a
-moment to be visible from another edge location. Acceptable for a demo
-line, not for real traffic -- which is why it's a switch, not a rewrite.
+Eight nodes, built in the Portal. The live flow is exported to
+`docs/conversation-flow.json`.
 
-## Why one MCP server, not three
+| Node | Type | What it does |
+|---|---|---|
+| Disclosure | speak | Greeting, recording notice, what the line can do |
+| Identify Intent | prompt | Classifies the request. Has no tools of its own |
+| Existing Appointment Check | prompt | Looks up the caller by mobile number, reads back the appointment, reschedules or cancels it |
+| Book Appointment | prompt | Department, name, available slots, booking, SMS confirmation |
+| Admin FAQ | prompt | General questions about the departments; says so when it doesn't know |
+| Emergency Escalation | speak | Tells the caller to hang up and dial 997 |
+| Appointment Closing | speak | Goodbye |
+| Close Call | tool | Hang up |
 
-`get_available_slots`, `book_appointment`, and
-`reschedule_or_cancel_appointment` all take **`department` as a parameter**
-(`"general_medicine" | "pediatrics" | "dental"`), not as three separate
-tool sets or three separate servers. One MCP server, six tools, scoped per
-workflow node (the demo/admin `reset_patient_state` tool is scoped only to
-a node outside the caller-facing flow, so it's never reachable from
-ordinary conversation).
+Identify Intent routes to Existing Appointment Check in two ways: directly
+when the webhook reported `has_existing_appointment`, and through an LLM
+condition whenever the caller asks about an appointment they already have.
+The second route matters because MCP tools are available in every node: a
+node's `tools` setting only governs its own inline tools. Without an
+explicit route, the model would handle the request from Identify Intent
+itself.
 
-This also means the **conversation workflow graph doesn't fork three ways
-per department** -- there's one "new booking" shape and one "reschedule"
-shape, each asking which department as a normal conversational turn, not
-as a structural branch. See `docs/conversation-flow.json`'s
-`_design_notes.department_as_parameter` for the one place this still shows
-up as two thin node pairs (`n_get_slots_new`/`n_get_slots_reschedule`,
-`n_offer_slots_new`/`n_offer_slots_reschedule`) -- an artifact of Telnyx
-tool nodes routing to a fixed next node, not of department duplication.
+**Emergencies.** Identify Intent and Admin FAQ, the two open-ended nodes,
+have an LLM edge to Emergency Escalation. The other nodes don't.
 
-## Safety net (and its stated limit)
+## MCP tools
 
-Every call opens with a disclosure that this line is for scheduling/general
-info only and names the Saudi emergency number, 997. On top of that, an
-LLM-condition edge for emergency language is checked **first** (before any
-other routing) on exactly two nodes: `n_identify_intent` (every call passes
-through it) and `n_admin_faq` (the other open-ended node where a caller
-could raise something urgent mid-question). It is **not** wired onto every
-node in the graph -- an emergency mentioned deep inside, say, the
-slot-selection prompt wouldn't trigger it. That's a stated limitation, not
-a hidden gap: the two chosen nodes cover the points where a caller is
-actually free to say anything, and adding the same edge everywhere else
-would 2x the edge count for turns that are already narrow, closed
-questions ("which time works?").
+| Tool | Purpose |
+|---|---|
+| `get_patient_status` | Name, call count, and current appointment for a phone number |
+| `get_available_slots` | Next five slots for a department (the department is a parameter) |
+| `book_appointment` | Book a slot and save the patient's name |
+| `reschedule_or_cancel_appointment` | Move or cancel the current appointment |
+| `send_appointment_confirmation_sms` | Text the booked appointment to the patient |
+| `reset_patient_state` | Admin/demo only; not in the assistant's allowed tools |
 
-## Scope cuts (deliberate, not oversights)
+A single server serves all three departments, because every scheduling
+tool takes the department as a parameter.
 
-- **Mocked calendar.** `nextAvailableSlots` is a deterministic generator
-  (Sun-Thu, 10/11/13/14/15 local, Asia/Riyadh), not a real
-  practice-management system integration. Every slot it returns follows
-  the same fixed daily pattern, so it can't be mistaken for a real
-  schedule if someone reads the code.
-- **One current appointment per patient, not a history array.** A second
-  booking overwrites the first rather than appending. Simpler Actor state,
-  and matches this being a scheduling front door, not the system of
-  record.
-- **Telnyx Messaging, not a third-party SMS provider.** One vendor, one
-  credential, consistent with everything else being Telnyx-native.
-- **No email/`send_followup_email` tool.** SMS confirmation only, to keep
-  the tool count and the demo focused.
+**Phone numbers.** `lib/phone.ts` normalizes Saudi mobiles (`05…`, `5…`,
+`9665…`) and US/NANP numbers to E.164. Portal browser-test callers
+(`name@sip.telnyx.eu`) are mapped to a key containing only letters, digits
+and underscores (`sip_name_sip_telnyx_eu`).
+
+**Slots.** Sunday to Thursday, at 10:00, 12:00, 14:00 and 16:00 Riyadh time
+(stored as 07:00, 09:00, 11:00 and 13:00 UTC), starting the next business
+day. Same-day slots are offered when the KV flag is on.
+
+## Voice and model
+
+- **LLM: Kimi K2.6.** It gave the lowest end-to-end latency
+  (speech-to-text, then LLM, then text-to-speech) with good answers and
+  reliable tool calling. Qwen 235B also performed well but was slower.
+  GLM didn't produce usable turns.
+- **Voice: Telnyx Ultra. Transcription: `azure/fast` (en-US).** Chosen for
+  latency. The Humain "Abdulaziz" voice sounded more natural to Arabic
+  speakers, but added latency.
+- **English only.** In a hospital setting, Arabic speakers switch to
+  English medical terms mid-sentence, so relying on automatic
+  code-switching gives unreliable transcripts. A language choice at the
+  start of the call (IVR) would support Arabic cleanly, with a dedicated
+  Arabic assistant behind it.
 
 ## Setup
 
-1. `cd webhook-function && npm install && npm run typecheck`
-2. `cd mcp-server && npm install && npm run typecheck`
-3. Deploy both with `telnyx-edge ship` (from each project directory).
-4. In the Portal, create secrets:
-   - `webhook-function`: `TELNYX_PUBLIC_KEY` (Mission Control -> Webhooks ->
-     Ed25519 public key, base64).
-   - `mcp-server`: `HOSPITAL_SMS_FROM_NUMBER` (the assistant's Telnyx
-     number, E.164).
-5. Point the AI Assistant's `dynamic_variables_webhook_url` at the deployed
-   `webhook-function` URL, and add the deployed `mcp-server` URL under
-   `mcp_servers`.
-6. Build the Conversation Workflow in the Portal canvas using
-   `docs/conversation-flow.json` as the reference graph (node/edge
-   structure, instructions, tool wiring) -- see the note on that file
-   below for why it's a reference rather than an import-ready payload.
-7. Voice: Humain provider, voice "Abdulaziz", transcription model
-   `humain/realtime`, transcription language "Arabic + English
-   (Code-switching)" -- live-tested mid-conversation code-switching before
-   this rebuild; carries over unchanged.
-8. Completion model: **Qwen 235B**, picked from three live-tested
-   candidates -- see "Model selection" below for the evaluation and the
-   one fix it drove.
-9. Run `python3 docs/validate_flow.py` after any edit to the workflow graph
-   -- checks every edge resolves to a real node, every node is reachable,
-   every speak node has exactly one default edge, the hangup node has
-   none, and default edges evaluate last.
+Requires Node.js, npm, and the `telnyx-edge` CLI (v0.5.4 was used).
 
-### About `docs/conversation-flow.json`
+1. Install and test:
+   ```
+   (cd webhook-function && npm install && npm test)
+   (cd mcp-server && npm install && npm test)
+   ```
+2. Create both functions. Run `new-func` from an empty folder, because it
+   writes a template project, then copy each printed `[edge_compute]` block
+   (`func_id`, `func_name`) into the matching `telnyx.toml`:
+   ```
+   telnyx-edge new-func --language ts --name hospital-webhook-v2
+   telnyx-edge new-func --language ts --name hospital-mcp-v2
+   ```
+3. Create the secrets on the account (`telnyx-edge secrets`):
+   `TELNYX_PUBLIC_KEY` (the webhook signing public key) and
+   `HOSPITAL_SMS_FROM_NUMBER` (the sender number, in E.164). Set the KV
+   namespace id under `[storage.kv.DEPARTMENT_KV]` in both `telnyx.toml`
+   files.
+4. Generate the binding types, then deploy. The webhook goes first, since
+   it owns the actor type:
+   ```
+   (cd webhook-function && telnyx-edge types && telnyx-edge ship)
+   (cd mcp-server && telnyx-edge types && telnyx-edge ship)
+   ```
+5. Check both functions:
+   ```
+   telnyx-edge bindings validate
+   curl https://<webhook-host>/health
+   curl https://<mcp-host>/health
+   ```
+6. In the Portal:
+   - Set the assistant's **Dynamic Variables Webhook URL** to the webhook
+     host.
+   - Add an **MCP server** with the MCP function's host (no path) and allow
+     the five caller-facing tools.
+   - Build the flow from `docs/conversation-flow.json`. To load it via the
+     API, send `POST /v2/ai/assistants/<id>` with `{"conversation_flow": …}`.
+   - Assign the phone number.
+7. After editing the flow, run `python3 docs/validate_flow.py`. It checks
+   that every edge resolves, every node is reachable, speak nodes have
+   exactly one default edge, and nothing dead-ends except the hang-up.
 
-This was built and edited live in the Portal's workflow canvas (per the
-challenge's own tooling), so this file is the **reviewable reference
-form** of that graph -- structurally validated (`validate_flow.py`) and
-schema-checked against Telnyx's documented node/edge shapes as of
-2026-09-25 -- not a payload independently confirmed to import byte-for-byte
-via the API. Two fields on tool/prompt nodes (`tool_name`, and per-node
-`tools` scoping) are our best-effort naming: the docs describe per-node
-tool scoping only as a Portal UI feature (a dropdown + checklist), not at
-the JSON-field level, so those two names weren't independently verified
-the way the node/edge/condition shapes were. Flagged in the file's own
-`_design_notes.unverified_field`, not glossed over.
+## Operations
 
-**Out of date as of 2026-09-27.** The live Portal flow has since been
-simplified to 8 nodes (Book Appointment and Existing Appointment Check each
-do their whole job in one prompt node instead of separate tool nodes), so
-this file no longer matches it. The Portal is the source of truth; the live
-flow can be exported with `GET /v2/ai/assistants/<id>` (`conversation_flow`).
-Also learned: a node's `tools` / `tools_mode` only govern its own inline
-tools -- MCP tools are available assistant-wide.
-
-## Observability
-
-- **Structured logs.** Every log line is single-line JSON
-  (`{level, event, timestamp, ...fields}`) via `lib/logger.ts` in both
-  projects -- Edge Compute has no platform log dashboard, so logs are read
-  with `telnyx-edge logs <func> --tail`, and JSON keeps them greppable by
-  `event` or `correlation_id`.
-- **Latency signal.** `withTiming(event, fields, fn)` wraps every webhook
-  invocation and every MCP tool call, emitting `<event>.success` or
-  `<event>.failure` with `duration_ms`. `telnyx-edge metrics <func>` gives
-  p50/p95/p99 on top of that.
-- **Correlation ID.** Minted once per webhook call
-  (`crypto.randomUUID()`), logged on every line for that call, and handed
-  back to the assistant as a `correlation_id` dynamic variable so a demo
-  walkthrough can pull one call's full trace across both functions from a
-  single ID.
-
-- **Health check.** `GET /health` on either function round-trips a
-  synthetic KV key; `GET /health?actor=1` also calls the actor on a
-  synthetic instance, capped at 8 s so a broken actor shows as `timeout`
-  instead of a 30 s hang. No secret needed and no patient data touched.
-  This is how to tell when actors work again and the switch can go back.
-
-## Debugging story
-
-### Stateful Actor calls failing account-wide (2026-09-26 → open)
-
-**Symptom.** From 2026-09-26 every call to `PatientActor` hung ~30 s and
-failed with `actor invocation <account>__PatientActor/<id>.<method>
-returned 502: bad gateway`. Live calls stalled on `get_patient_status` and
-booking. Call transcripts show the same calls working in ~1-2 s from
-2026-09-25 22:37 to 2026-09-26 00:23 UTC; the first failure on record is
-2026-09-26 22:18 UTC.
-
-**Narrowing it down**, one variable at a time:
-
-| Test | Result |
+| Task | Command |
 |---|---|
-| Call from the owning function (webhook) vs the referencing one (MCP server) | Both fail |
-| `getProfile` vs `recordCallStart` (the method that had been reliable) | Both fail |
-| Fresh, never-used instance id | Fails |
-| Proxying MCP calls through the owner over HTTP (a workaround tried and removed) | Fails -- the owner's own call fails too |
-| Brand-new functions (`hospital-*-v2`) with a brand-new actor type (`PatientActorV2`) | Fails on its very first call |
-| Owner function's own logs at the moment of failure | Pod up and serving HTTP; the call leaves for `actor-router…svc:8081` (Dapr) and never comes back in -- the actor code never runs |
+| Health (KV) | `curl https://<host>/health` |
+| Health (KV and actor, 8 s cap) | `curl "https://<host>/health?actor=1"` |
+| Logs | `telnyx-edge logs <function> --since 15m` |
+| Metrics | `telnyx-edge metrics <function>` |
+| KV credential | `telnyx-edge bindings validate`; if invalid, `telnyx-edge bindings update` |
+| Actor types and owners | `telnyx-edge actors list` |
 
-Library versions (`@telnyx/edge-runtime` 0.15.3, `telnyx` 7.23.0), config and
-the actor class are the same as in the original, working project.
-Rollback wasn't available: Telnyx refuses rollback for functions that own
-an actor type.
+`/health` touches only synthetic keys, so it needs no secret. Logs are
+single-line JSON, `{level, event, timestamp, …}`. `withTiming` logs
+`<event>.success` or `<event>.failure` with `duration_ms`, and a handler
+that returns an HTTP 5xx or an MCP tool error counts as a failure. Each
+call gets a `correlation_id`, which is logged on every line and passed to
+the assistant as a dynamic variable.
 
-**Account state found along the way.** `scratch-actor-check`, an early
-experiment that owns an actor type (`Counter`), is stuck: its delete failed
-on 2026-09-26 17:22 UTC, `actors delete Counter` refuses because the
-function still binds it, and `reset-func`/`delete-func` on the function fail
-or return it to `delete_failed`. Separately, the KV binding started
-returning `401 token expired`; `telnyx-edge bindings update` fixed that in
-place, without a redeploy.
+## Tests
 
-**A possible trigger on our side.** On 2026-09-26 `phone.ts` started passing
-Portal browser-test identities (e.g. `lnxxs9gu@sip.telnyx.eu`) straight
-through as actor instance ids, producing addresses like
-`…/PatientActor/lnxxs9gu@sip.telnyx.eu.recordCallStart` -- an id containing
-the `.` that separates id from method. Failures followed. It's unproven
-(the brand-new type failed without ever seeing such an id), but ids are now
-restricted to `[a-z0-9_+]` (`sipIdentityKey`) so it can't recur.
-
-**Where it stands.** Reported to Telnyx with the above. The line runs on the
-KV stopgap (see "Current state" at the top) and was verified end to end on
-2026-09-27: lookup, booking, confirmation SMS, and a second call finding the
-booking.
-
-**Also fixed along the way:** "check my appointment" requests got stuck in
-the Identify Intent node -- the only route out required webhook-supplied
-variables, and MCP tools are assistant-wide (a node's `tools` setting only
-governs its own inline tools), so the model did the lookup itself. Added an
-LLM edge for existing-appointment requests and gave Existing Appointment
-Check the reschedule/cancel steps and a route to booking.
-
-**The `@telnyx/opencode` plugin failed to load**, blocking the
-challenge's required Telnyx-Inference-via-OpenCode coding workflow before
-any code was written. `opencode auth login telnyx` returned `Integration
-not found: telnyx` (0 matches in the interactive picker). `opencode plugin
-list` showed the plugin installed but with blank ID/VERSION columns --
-the first sign it hadn't actually loaded. Re-running with
-`--print-logs --log-level debug` surfaced the real error:
-
-```
-message="failed to load plugin" target=@telnyx/opencode
-cause="Cause([Fail(PluginModule.LoadError: Plugin must export a default
-definition with an id and an effect or setup function.
-(cause: SchemaError(Expected object at [\"default\"])))])"
-```
-
-Cross-checked against the npm registry: `@telnyx/opencode@0.1.5` declares a
-peer dependency on `@opencode-ai/plugin@^1.2.27`, while the installed CLI
-was `opencode v2.0.16` -- a version-skew hypothesis consistent with the
-schema error (the plugin's exported shape no longer matches what this CLI
-version expects). Reported to the Telnyx contact with the exact log and
-version numbers; work continued via the Portal's model picker in the
-meantime (model selection is user-visible either way) so the build wasn't
-blocked on a resolution.
-
-**A second, still-open issue**: phone number provisioning. Saudi Arabia
-numbers require full business KYC (trade license, 12-month commitment) --
-expected and documented by Telnyx. A US (Washington DC) number was added
-to cart and reached checkout, but the order did not complete: mid-checkout,
-the account was prompted to "upgrade" via a LinkedIn login, and immediately
-after, the *same* Buy Numbers flow reported the account as
-Saudi-Arabia-only on a trial tier, while a Saudi Arabia search in that same
-session returned "no search coverage in this country" -- a direct
-platform-side contradiction, not a configuration mistake on this end.
-Reported with the exact chronological sequence (pretrial -> cart -> upgrade
-prompt -> post-upgrade contradiction); unresolved as of this rebuild. In
-the meantime: confirmed Telnyx AI Assistants also support a WebSocket-based
-voice interface for development/testing that doesn't require a phone
-number, and confirmed via the challenge doc that a working phone number is
-a hard submission requirement regardless (named three separate times), so
-this is being tracked to resolution rather than designed around.
-
-## Model selection
-
-The Conversation Workflow's completion model (the LLM driving the live
-phone conversation -- distinct from the `opencode.jsonc` model used to
-*write* this code) was chosen by running the same booking scenario as a
-real test call against the deployed workflow and reading back the Portal's
-exported conversation transcript, not by spec comparison. Three candidates:
-
-- **GLM** -- ruled out early; didn't produce usable turns in the workflow
-  and wasn't pursued further once Kimi looked viable.
-- **Kimi K2.6** -- completed conversations, but with repeated ~40-second
-  dead-air stalls mid-call (the caller hears nothing while the model
-  thinks) -- disqualifying for a live phone line regardless of eventual
-  correctness.
-- **Qwen 235B** -- selected. Never went dead-silent; the closest analog was
-  asking the caller to repeat the available slots twice, each resolved
-  within a few seconds. Completed a full existing-patient flow end to end
-  (status lookup -> saw the existing Dental appointment -> booked a new
-  General Medicine slot -> clean confirmation) with a correct booking and
-  no dropped state.
-
-Reading that transcript surfaced one real defect, fixed in this repo:
-**`get_patient_status` was called on incomplete phone-number digits.** The
-caller answered in fragments (`"of course it's zero five"`, then later
-`"four five six seven eight"`), and the model called the tool after each
-fragment instead of waiting for a complete number:
-
-```
-user      "of course it's zero five"
-assistant [tool call] get_patient_status({"phone_number": "05"})
-tool      "Invalid phone number: 05"
-user      "four five six seven eight"
-assistant [tool call] get_patient_status({"phone_number": "45678"})
-tool      "Invalid phone number: 45678"
-```
-
-`mcp-server`'s `normalizeSaudiPhone` (`lib/phone.ts`) caught every one of
-these cleanly and the model recovered each time rather than crashing, so
-this was never a correctness bug -- but it's wasted tool round-trips and
-awkward dead time on a real call. Fixed by tightening
-`get_patient_status`'s tool description (`mcp-server/src/index.ts`) to
-explicitly instruct the model to wait for a complete number -- and name
-the valid Saudi shapes -- before calling it, rather than relying on the
-model to infer that from a validation error after the fact.
-
-A second, smaller observation from the same transcript -- the model moved
-from "reschedule, cancel, or book an additional appointment?" straight
-into checking General Medicine slots with no caller turn confirming
-"additional" in between -- is noted but **not** treated as a confirmed bug:
-it's equally consistent with a merged/dropped row in the CSV export as
-with a real skipped confirmation, and wasn't reproduced on a second look.
-Flagged here rather than fixed blind; worth watching for on the next live
-test rather than acted on now.
+- 34 unit tests (`npm test`): phone normalization, the KV record store
+  (including key format and uniqueness), `/health`, and slot generation.
+  Both projects type-check with `tsc --noEmit`.
+- `docs/validate_flow.py` checks the structure of the conversation flow.
+- End-to-end on the live number (2026-09-27): intent routing, lookup,
+  booking, the confirmation SMS, and a second call finding the booking.
 
 ## Known issues
 
 - **Appointment times are read out inconsistently.** Slots are stored
   correctly in UTC, but the model converts them to Riyadh time itself and
-  gets it wrong: in testing, a `13:00Z` slot (4 PM Riyadh) was offered as
-  "2 PM" and later read back as "1 PM", and the confirmation SMS shows the
-  raw UTC timestamp. Planned fix: tools return a ready-made
-  Riyadh-time `displayTime` next to every `slotTime`, the model is told to
-  read it verbatim and pass `slotTime` back unchanged, and the SMS and the
-  webhook's `existing_appointment_time` use the same label. Also: the
-  assistant's base instructions render the current time in
-  `America/Los_Angeles`; they should say `Asia/Riyadh`.
-- **Patient state is on the KV stopgap** until actor calls work again
-  (`/health?actor=1`), with the concurrency trade-off described above.
-- **The KV binding's credential can expire.** Check with
-  `telnyx-edge bindings validate`; renew with `telnyx-edge bindings update`.
-- **Model choice.** The assistant currently runs `moonshotai/Kimi-K2.6`;
-  "Model selection" below records choosing Qwen 235B over Kimi because of
-  mid-call stalls. To reconcile.
+  gets it wrong. A 13:00 UTC slot (4 PM Riyadh) was offered as "2 PM" and
+  later read back as "1 PM". The confirmation SMS shows the raw UTC
+  timestamp. The fix: tools return a ready-made Riyadh-time `displayTime`
+  with every slot and appointment, the model reads it out as written and
+  passes `slotTime` back unchanged, and the SMS and webhook use the same
+  label. The assistant's base prompt should also state the current time in
+  `Asia/Riyadh`, not `America/Los_Angeles`.
+- **Patient records are on the KV fallback** until actor calls work again.
+  See "Patient records" above for the trade-off.
+- **The KV credential can expire.** `telnyx-edge bindings validate` shows
+  its state, and `bindings update` renews it.
 
-## Known things to verify
+## Incident: Stateful Actor calls failing account-wide (since 2026-09-26)
 
-Built without a live Telnyx account to run `telnyx-edge types` / `ship`
-against, so the following were verified as far as static tooling allows,
-and are flagged rather than silently assumed correct:
+**Symptom.** Every actor call hangs about 30 seconds, then fails with
+`actor invocation <account>__PatientActor/<id>.<method> returned 502: bad
+gateway`. The same calls completed in 1 to 2 seconds between 2026-09-25
+22:37 and 2026-09-26 00:23 UTC. The first recorded failure is 2026-09-26
+22:18 UTC.
 
-- **Verified against real, installed npm packages via `tsc --noEmit`** (both
-  projects, zero errors) with a deliberate-typo check in each confirming
-  the type-checker genuinely catches mistakes rather than silently
-  passing: `@telnyx/edge-runtime@0.15.3`'s actual shipped `.d.ts` files
-  (`StatefulActor`, `ActorNamespace`/`idFromName` returning a directly
-  callable stub, `ActorStorage`, `KvNamespace`), and the real `telnyx@7.23.0`
-  SDK's `webhooks.unwrap`/`TelnyxWebhookVerificationError` and
-  `messages.send` shapes -- not assumed from memory. `Env` bindings are a
-  hand-written `declare module` augmentation standing in for
-  `telnyx-edge types`' generated file (documented inline in each
-  `types.ts`).
-- **Verified against fetched, current Telnyx docs (2026-09-25)**: the
-  dynamic-variables webhook's exact request envelope
-  (`data.payload.telnyx_end_user_target` etc.), its response contract
-  (`{"dynamic_variables": {...}}`, ignored if not wrapped that way), its
-  default/max timeouts (1.5s default, 10s max), and the conversation
-  workflow's node/edge JSON shapes.
-- **Not independently verified**: the exact runtime behavior of the
-  ambient `env` singleton under concurrent requests on live Edge Compute
-  (used consistently across both functions, grounded in the SDK's own
-  documented usage pattern, but not exercised against a live deployment);
-  the two `tool_name`/`tools` field names noted above; the actual demo
-  phone number and MCP URL, pending the still-open account issue.
+**Isolation:**
 
-## Stretch goals
+| Test | Result |
+|---|---|
+| Called from the owning function and from the referencing function | Both fail |
+| Different methods (`getProfile`, `recordCallStart`) | All fail |
+| A never-used instance id | Fails |
+| New functions with a new actor type (`PatientActorV2`) | Fails on the first call |
+| The original project code | Actor code, config, and library versions identical to what is deployed |
+| Owning function's logs | Pod running and serving HTTP; the call goes out to the actor router (`actor-router…svc:8081`) and never reaches the actor |
 
-- **Shared Actors** -- `PatientActor` is owned by `webhook-function`,
-  reused by `mcp-server` via a type-only cross-project import and a
-  matching `telnyx.toml` `type` with no class shipped.
-- **Variable-comparison edges**, including a compound one
-  (`is_repeat_caller == "true" AND has_existing_appointment == "true"`)
-  and tool-node routing on `telnyx_last_tool_status_code`.
-- **KV feature flag** (`SAME_DAY_SLOTS_ENABLED`), toggleable without a
-  redeploy.
-- **Distributed tracing**, via the `correlation_id` minted in
-  `webhook-function` and threaded through every log line in both
-  functions.
-- Not attempted this pass: multi-assistant routing, Actor alarms, object
-  storage.
+**Account state.** An early test function, `scratch-actor-check`, owns an
+actor type (`Counter`). Its deletion failed on 2026-09-26 at 17:22 UTC and
+it can't be removed now: `actors delete Counter` refuses while the function
+still binds it, and `reset-func` returns the function to `delete_failed`.
+Telnyx also doesn't allow rollback for functions that own an actor type.
+
+**Possible trigger.** From 2026-09-26, browser-test caller identities such
+as `lnxxs9gu@sip.telnyx.eu` were used directly as actor ids. That produced
+addresses like `…/PatientActor/lnxxs9gu@sip.telnyx.eu.recordCallStart`,
+where the id contains the `.` that separates id from method. Failures
+started after that change. It isn't confirmed as the cause, since the new
+actor type failed without ever receiving such an id. Ids are now limited to
+letters, digits, `_` and `+`.
+
+**Next step:** report to Telnyx with the evidence above, and ask for the
+actor router for this account to be checked and the stuck function and
+`Counter` type removed.
+
+## Other issues along the way
+
+- **opencode plugin.** `@telnyx/opencode` failed to load under opencode
+  v2.0.16 (`Plugin must export a default definition…`); the plugin targets
+  `@opencode-ai/plugin@^1.2.27`. Solved by configuring Telnyx Inference
+  directly as an OpenAI-compatible provider in `opencode.json`. The
+  project was written with opencode on Kimi K2.6.
+- **Phone number.** The provided purchase path didn't complete, so the
+  number was bought directly on the account.
+- **KV key format.** A key containing `:` failed with `400 Invalid key
+  format`. Keys now use only characters KV allows.
+- **KV authentication.** KV calls returned `401 token expired`. Fixed with
+  `telnyx-edge bindings update`, without a redeploy.
+- **Partial phone numbers.** The model called `get_patient_status` while
+  the caller was still reading out digits (`"05"`, then `"45678"`). The
+  tool description now tells it to wait for a complete number and lists
+  the valid formats.
+
+## Repository
+
+```
+webhook-function/   dynamic-variables webhook; ships PatientActorV2
+  src/index.ts                 webhook handler and /health
+  src/actors/patientActor.ts   the actor
+  src/lib/patientRecords.ts    actor/KV switch and KV store (shared with mcp-server)
+  src/lib/phone.ts             caller id normalization
+  src/lib/kv.ts                department directory and feature flag
+  src/lib/health.ts            /health
+  src/lib/logger.ts            JSON logs and timing
+mcp-server/         MCP tools and /health
+  src/lib/patientActorClient.ts  patient-record calls
+  src/lib/scheduling.ts          slot generation
+  src/lib/telnyxApi.ts           SMS
+docs/               live conversation flow and its validator
+opencode.json       Telnyx Inference provider for opencode
+```
 
 ## Design history
 
-This was originally an HR pre-screening voice agent (single job req,
-single-turn screening call). Pivoted to hospital multi-department
-appointments + administrative QA to exercise more of what the challenge
-actually grades: a real multi-branch workflow (booking vs. reschedule vs.
-cancel vs. FAQ vs. emergency, not one linear screening script), a
-parameterized MCP tool set instead of a flat one, and a safety-relevant
-edge case (the emergency escalation path) worth defending explicitly
-rather than incidentally. The Saudi Arabic/English bilingual framing and
-the voice/transcription configuration were validated in the Portal before
-the pivot and carried over unchanged.
+The project started as an HR pre-screening agent. It became a hospital
+scheduling line to exercise more of the platform: a branching conversation
+flow (check, book, reschedule, cancel, FAQ, emergency), parameterized MCP
+tools, state shared between two functions, and an emergency path.
