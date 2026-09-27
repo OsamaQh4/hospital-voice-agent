@@ -6,7 +6,15 @@ Pediatrics, and Dental. Callers can check, book, reschedule, or cancel an
 appointment, get an SMS confirmation, and ask general questions about the
 departments. It gives no medical advice, and it directs emergencies to 997.
 
-**Call it: +1 512 316 0965**
+| | |
+|---|---|
+| Phone number | **+1 512 316 0965** |
+| Dynamic-variables webhook | https://hospital-webhook-v2-d8dc2b29-b.telnyxcompute.com |
+| MCP server | https://hospital-mcp-v2-da6c4e1c-8.telnyxcompute.com |
+| Health checks | `/health` on either URL (add `?actor=1` to include the actor) |
+
+Try it: call the number and ask to book an appointment, then call again and
+ask to check it. Demo walkthrough: [`docs/demo-script.md`](docs/demo-script.md).
 
 Built for the Telnyx Forward Deployed Engineer take-home.
 
@@ -34,7 +42,7 @@ Built for the Telnyx Forward Deployed Engineer take-home.
 - **`webhook-function`** (`hospital-webhook-v2`) runs once at call start.
   It verifies the request's Ed25519 signature (`telnyx.webhooks.unwrap`),
   records the call against the caller's number, and returns dynamic
-  variables to the assistant: `patient_full_name`, `is_repeat_caller`,
+  variables to the assistant: `patient_phone_number`, `patient_full_name`, `is_repeat_caller`,
   `has_existing_appointment`, `existing_appointment_department`,
   `existing_appointment_time`, `department_list`, `same_day_slots_enabled`,
   and `correlation_id`. It also ships the `PatientActorV2` class.
@@ -190,6 +198,26 @@ Requires Node.js, npm, and the `telnyx-edge` CLI (v0.5.4 was used).
 
 ## Operations
 
+### Knowing it's broken within a minute
+
+1. **`/health` on both functions.** It returns `"ok": false` and names the
+   failing dependency, KV or actor, in about a second, without placing a
+   call. It can be polled every 30 seconds by any uptime checker.
+2. **Failure events in the logs.** Every webhook call and tool call logs
+   `<event>.success` or `<event>.failure` with `duration_ms`. A run of
+   `.failure` lines, or `duration_ms` values near 30000 (the signature of
+   the actor outage), shows up in `telnyx-edge logs <function> --since 5m`.
+3. **The caller's side.** A lookup that fails shows up in the Portal
+   transcript as a `tool_timeout`, and the assistant apologises instead of
+   reading back the record.
+
+**What to look at first:** `/health?actor=1` on the webhook. It separates
+the three failure modes seen so far in one request: KV authentication
+(`401`), KV key format (`400`), and the actor never answering (`timeout`).
+Then the webhook logs, filtered by the call's `correlation_id`.
+
+### Commands
+
 | Task | Command |
 |---|---|
 | Health (KV) | `curl https://<host>/health` |
@@ -247,7 +275,7 @@ gateway`. The same calls completed in 1 to 2 seconds between 2026-09-25
 | Different methods (`getProfile`, `recordCallStart`) | All fail |
 | A never-used instance id | Fails |
 | New functions with a new actor type (`PatientActorV2`) | Fails on the first call |
-| The original project code | Actor code, config, and library versions identical to what is deployed |
+| The original project code | Same actor calls, config, and library versions as what is deployed |
 | Owning function's logs | Pod running and serving HTTP; the call goes out to the actor router (`actor-router…svc:8081`) and never reaches the actor |
 
 **Account state.** An early test function, `scratch-actor-check`, owns an
@@ -274,7 +302,8 @@ actor router for this account to be checked and the stuck function and
   v2.0.16 (`Plugin must export a default definition…`); the plugin targets
   `@opencode-ai/plugin@^1.2.27`. Solved by configuring Telnyx Inference
   directly as an OpenAI-compatible provider in `opencode.json`. The
-  project was written with opencode on Kimi K2.6.
+  project was built with opencode on Telnyx Inference (Kimi K2.6); the
+  later debugging and the KV fallback were done with Claude.
 - **Phone number.** The provided purchase path didn't complete, so the
   number was bought directly on the account.
 - **KV key format.** A key containing `:` failed with `400 Invalid key
