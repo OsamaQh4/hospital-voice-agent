@@ -6,13 +6,10 @@ const DEPARTMENT_DIRECTORY_KEY = "department_directory";
 const SAME_DAY_SLOTS_KEY = "feature_flag_same_day_slots_enabled";
 
 /**
- * Static-ish reference data (department names, referral/walk-in policy) --
- * read on every call, changes rarely, wrong for at most one call if it does.
- * This is the textbook KV case: cheap, eventually-consistent, no per-patient
- * identity. Contrast with PatientActor, which holds one caller's booking
- * state and needs read-your-writes + serialized updates -- KV does not give
- * you that, which is why booking state is an Actor and this is KV, not the
- * other way around.
+ * Department reference data (names, referral and walk-in policy): read on
+ * every call, rarely changed, and not tied to any one patient, so it lives
+ * in KV. Patient records need serialized read-modify-write and live in the
+ * actor (see patientRecords.ts).
  */
 const DEFAULT_DEPARTMENTS: DepartmentInfo[] = [
   {
@@ -39,13 +36,9 @@ const DEFAULT_DEPARTMENTS: DepartmentInfo[] = [
 ];
 
 /**
- * KV is meant to be a soft-fail read (see comment above) -- a platform-side
- * KV error should degrade to the built-in defaults, not crash the caller.
- * Seen in production 2026-09-26 17:42 UTC: an uncaught KV 500 here took
- * down the whole webhook-function process for ~2.5 minutes, which also
- * made the shared PatientActor (hosted by this same function) unreachable
- * and caused unrelated get_patient_status calls on mcp-server to hang 30s
- * and 502. Both functions now fail open instead.
+ * Fails open: if KV is unavailable (for example an expired binding
+ * credential returning 401), the call continues with the built-in defaults
+ * instead of failing. The directory is seeded into KV on first read.
  */
 export async function getDepartmentDirectory(kv: KvNamespace): Promise<DepartmentInfo[]> {
   try {

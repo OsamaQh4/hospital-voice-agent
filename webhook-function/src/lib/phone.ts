@@ -1,6 +1,6 @@
 /**
  * Resolves a caller identifier to the stable string used as the
- * PatientActor key (and, for real phone numbers, the SMS destination).
+ * patient record key (and, for real phone numbers, the SMS destination).
  *
  * Three distinct shapes reach this in practice, each handled in its own
  * way rather than forced through one phone-shaped regex:
