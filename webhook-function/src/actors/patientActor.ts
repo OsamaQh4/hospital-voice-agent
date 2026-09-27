@@ -3,7 +3,7 @@ import type { AppointmentStatus, Department, PatientProfile } from "../types";
 
 const PROFILE_KEY = "profile";
 
-export class PatientActor extends StatefulActor {
+export class PatientActorV2 extends StatefulActor {
   private async loadProfile(): Promise<PatientProfile> {
     const existing = await this.ctx.storage.get<PatientProfile>(PROFILE_KEY);
     if (existing) {
@@ -46,12 +46,22 @@ export class PatientActor extends StatefulActor {
   }
 
   async bookAppointment(department: Department, slotTime: string): Promise<PatientProfile> {
+    const VALID_DEPARTMENTS: Department[] = ["general_medicine", "pediatrics", "dental"];
+    if (!VALID_DEPARTMENTS.includes(department)) {
+      throw new Error(`Invalid department: ${department}`);
+    }
+    if (Number.isNaN(new Date(slotTime).getTime())) {
+      throw new Error(`Invalid slotTime: ${slotTime}`);
+    }
     const profile = await this.loadProfile();
     profile.currentAppointment = { department, slotTime, status: "booked" };
     return this.saveProfile(profile);
   }
 
   async rescheduleAppointment(newSlotTime: string): Promise<PatientProfile> {
+    if (Number.isNaN(new Date(newSlotTime).getTime())) {
+      throw new Error(`Invalid slotTime: ${newSlotTime}`);
+    }
     const profile = await this.loadProfile();
     if (profile.currentAppointment === null) {
       throw new Error("No existing appointment to reschedule");
@@ -69,7 +79,17 @@ export class PatientActor extends StatefulActor {
     return this.saveProfile(profile);
   }
 
+  /**
+   * Update the status of the current appointment.
+   * Not currently exposed via any MCP tool, but kept for potential
+   * future use (e.g. marking an appointment "completed" after the
+   * patient is seen, or "cancelled" via an external admin flow).
+   */
   async updateAppointmentStatus(status: AppointmentStatus): Promise<PatientProfile> {
+    const VALID_STATUSES: AppointmentStatus[] = ["none", "booked", "completed", "cancelled"];
+    if (!VALID_STATUSES.includes(status)) {
+      throw new Error(`Invalid status: ${status}`);
+    }
     const profile = await this.loadProfile();
     if (profile.currentAppointment) {
       profile.currentAppointment.status = status;

@@ -32,7 +32,17 @@ export async function withTiming<T>(
   try {
     const result = await fn();
     const duration_ms = Date.now() - start;
-    log("info", `${event}.success`, { ...fields, duration_ms });
+    // A handler that caught its own error and answered with an HTTP 5xx
+    // (or an MCP tool result flagged isError) still "returned" -- log that
+    // as a failure, not a success, so the log can't contradict itself.
+    const status = result instanceof Response ? result.status : undefined;
+    const toolError =
+      typeof result === "object" && result !== null && (result as { isError?: unknown }).isError === true;
+    if ((status !== undefined && status >= 500) || toolError) {
+      log("error", `${event}.failure`, { ...fields, duration_ms, ...(status !== undefined ? { status } : {}) });
+    } else {
+      log("info", `${event}.success`, { ...fields, duration_ms, ...(status !== undefined ? { status } : {}) });
+    }
     return result;
   } catch (err) {
     const duration_ms = Date.now() - start;

@@ -57,6 +57,14 @@ one KV namespace. `telnyx.messages.send` (via the pre-authenticated
 `[telnyx]` binding) sends confirmation SMS; `telnyx.webhooks.unwrap`
 verifies the dynamic-variables webhook's Ed25519 signature.
 
+> **Current state (2026-09-27).** Patient records are temporarily stored in
+> **KV instead of the actor**, behind one switch (`PATIENT_BACKEND` in
+> `webhook-function/src/lib/patientRecords.ts`), because every Stateful
+> Actor call on this Telnyx account started failing on 2026-09-26 -- see
+> "Debugging story". The actor code is unchanged and still deployed
+> (`PatientActorV2`); flipping the switch back to `"actor"` restores the
+> design above. Live functions: `hospital-webhook-v2` and `hospital-mcp-v2`.
+
 ## Why Actor / KV / plain logic -- for every piece of state
 
 This is the question the challenge grades directly, so it's answered per
@@ -74,6 +82,14 @@ The one-line version: **Actor** when the same record is read-and-written by
 more than one caller in the same conversation and correctness depends on
 ordering; **KV** when it's shared, cache-shaped, and no single caller owns
 it; **plain logic** when there's nothing to persist at all.
+
+While the actor is unavailable, the KV stopgap mirrors `PatientActorV2`
+method for method (same validation, same return shapes), under keys
+`patient/<id>` (non-KV-safe characters such as `+` are written as `=2b`).
+It gives up exactly what the table above says the actor buys: two writes to
+the same patient in the same instant can lose one, and a write can take a
+moment to be visible from another edge location. Acceptable for a demo
+line, not for real traffic -- which is why it's a switch, not a rewrite.
 
 ## Why one MCP server, not three
 
@@ -168,6 +184,14 @@ the JSON-field level, so those two names weren't independently verified
 the way the node/edge/condition shapes were. Flagged in the file's own
 `_design_notes.unverified_field`, not glossed over.
 
+**Out of date as of 2026-09-27.** The live Portal flow has since been
+simplified to 8 nodes (Book Appointment and Existing Appointment Check each
+do their whole job in one prompt node instead of separate tool nodes), so
+this file no longer matches it. The Portal is the source of truth; the live
+flow can be exported with `GET /v2/ai/assistants/<id>` (`conversation_flow`).
+Also learned: a node's `tools` / `tools_mode` only govern its own inline
+tools -- MCP tools are available assistant-wide.
+
 ## Observability
 
 - **Structured logs.** Every log line is single-line JSON
@@ -185,7 +209,66 @@ the way the node/edge/condition shapes were. Flagged in the file's own
   walkthrough can pull one call's full trace across both functions from a
   single ID.
 
+- **Health check.** `GET /health` on either function round-trips a
+  synthetic KV key; `GET /health?actor=1` also calls the actor on a
+  synthetic instance, capped at 8 s so a broken actor shows as `timeout`
+  instead of a 30 s hang. No secret needed and no patient data touched.
+  This is how to tell when actors work again and the switch can go back.
+
 ## Debugging story
+
+### Stateful Actor calls failing account-wide (2026-09-26 → open)
+
+**Symptom.** From 2026-09-26 every call to `PatientActor` hung ~30 s and
+failed with `actor invocation <account>__PatientActor/<id>.<method>
+returned 502: bad gateway`. Live calls stalled on `get_patient_status` and
+booking. Call transcripts show the same calls working in ~1-2 s from
+2026-09-25 22:37 to 2026-09-26 00:23 UTC; the first failure on record is
+2026-09-26 22:18 UTC.
+
+**Narrowing it down**, one variable at a time:
+
+| Test | Result |
+|---|---|
+| Call from the owning function (webhook) vs the referencing one (MCP server) | Both fail |
+| `getProfile` vs `recordCallStart` (the method that had been reliable) | Both fail |
+| Fresh, never-used instance id | Fails |
+| Proxying MCP calls through the owner over HTTP (a workaround tried and removed) | Fails -- the owner's own call fails too |
+| Brand-new functions (`hospital-*-v2`) with a brand-new actor type (`PatientActorV2`) | Fails on its very first call |
+| Owner function's own logs at the moment of failure | Pod up and serving HTTP; the call leaves for `actor-router…svc:8081` (Dapr) and never comes back in -- the actor code never runs |
+
+Library versions (`@telnyx/edge-runtime` 0.15.3, `telnyx` 7.23.0), config and
+the actor class are the same as in the original, working project.
+Rollback wasn't available: Telnyx refuses rollback for functions that own
+an actor type.
+
+**Account state found along the way.** `scratch-actor-check`, an early
+experiment that owns an actor type (`Counter`), is stuck: its delete failed
+on 2026-09-26 17:22 UTC, `actors delete Counter` refuses because the
+function still binds it, and `reset-func`/`delete-func` on the function fail
+or return it to `delete_failed`. Separately, the KV binding started
+returning `401 token expired`; `telnyx-edge bindings update` fixed that in
+place, without a redeploy.
+
+**A possible trigger on our side.** On 2026-09-26 `phone.ts` started passing
+Portal browser-test identities (e.g. `lnxxs9gu@sip.telnyx.eu`) straight
+through as actor instance ids, producing addresses like
+`…/PatientActor/lnxxs9gu@sip.telnyx.eu.recordCallStart` -- an id containing
+the `.` that separates id from method. Failures followed. It's unproven
+(the brand-new type failed without ever seeing such an id), but ids are now
+restricted to `[a-z0-9_+]` (`sipIdentityKey`) so it can't recur.
+
+**Where it stands.** Reported to Telnyx with the above. The line runs on the
+KV stopgap (see "Current state" at the top) and was verified end to end on
+2026-09-27: lookup, booking, confirmation SMS, and a second call finding the
+booking.
+
+**Also fixed along the way:** "check my appointment" requests got stuck in
+the Identify Intent node -- the only route out required webhook-supplied
+variables, and MCP tools are assistant-wide (a node's `tools` setting only
+governs its own inline tools), so the model did the lookup itself. Added an
+LLM edge for existing-appointment requests and gave Existing Appointment
+Check the reschedule/cancel steps and a route to booking.
 
 **The `@telnyx/opencode` plugin failed to load**, blocking the
 challenge's required Telnyx-Inference-via-OpenCode coding workflow before
@@ -281,6 +364,26 @@ it's equally consistent with a merged/dropped row in the CSV export as
 with a real skipped confirmation, and wasn't reproduced on a second look.
 Flagged here rather than fixed blind; worth watching for on the next live
 test rather than acted on now.
+
+## Known issues
+
+- **Appointment times are read out inconsistently.** Slots are stored
+  correctly in UTC, but the model converts them to Riyadh time itself and
+  gets it wrong: in testing, a `13:00Z` slot (4 PM Riyadh) was offered as
+  "2 PM" and later read back as "1 PM", and the confirmation SMS shows the
+  raw UTC timestamp. Planned fix: tools return a ready-made
+  Riyadh-time `displayTime` next to every `slotTime`, the model is told to
+  read it verbatim and pass `slotTime` back unchanged, and the SMS and the
+  webhook's `existing_appointment_time` use the same label. Also: the
+  assistant's base instructions render the current time in
+  `America/Los_Angeles`; they should say `Asia/Riyadh`.
+- **Patient state is on the KV stopgap** until actor calls work again
+  (`/health?actor=1`), with the concurrency trade-off described above.
+- **The KV binding's credential can expire.** Check with
+  `telnyx-edge bindings validate`; renew with `telnyx-edge bindings update`.
+- **Model choice.** The assistant currently runs `moonshotai/Kimi-K2.6`;
+  "Model selection" below records choosing Qwen 235B over Kimi because of
+  mid-call stalls. To reconcile.
 
 ## Known things to verify
 

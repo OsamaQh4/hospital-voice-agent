@@ -1,15 +1,23 @@
 import { env } from "@telnyx/edge-runtime";
 import { TelnyxWebhookVerificationError } from "telnyx/lib/webhooks";
-import { PatientActor } from "./actors/patientActor";
+import { PatientActorV2 } from "./actors/patientActor";
 import { normalizeSaudiPhone } from "./lib/phone";
 import { log, withTiming } from "./lib/logger";
 import { getDepartmentDirectory, getSameDaySlotsFlag } from "./lib/kv";
+import { patientRecord } from "./lib/patientRecords";
+import { handleHealth } from "./lib/health";
 import type { DynamicVariablesWebhookEvent, DynamicVariablesWebhookResponse } from "./types";
 
-export { PatientActor };
+export { PatientActorV2 };
 
 export default {
   async fetch(request: Request): Promise<Response> {
+    const url = new URL(request.url);
+
+    if (url.pathname === "/health") {
+      return handleHealth(request, env, "webhook-function");
+    }
+
     const correlationId = crypto.randomUUID();
 
     return withTiming(
@@ -75,7 +83,7 @@ export default {
           return emptyResponse();
         }
 
-        const patient = env.PATIENT.idFromName(phoneNumber);
+        const patient = patientRecord(env, phoneNumber);
 
         const [profile, departments, sameDaySlotsEnabled] = await Promise.all([
           patient.recordCallStart(),

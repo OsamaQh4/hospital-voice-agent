@@ -13,7 +13,7 @@ import { nextAvailableSlots } from "./src/lib/scheduling";
 // defaulted to `new Date().toISOString()` at that moment).
 const fromDateIso = "2026-09-26T00:20:52.127771Z";
 
-console.log("Your local BUSINESS_HOURS_LOCAL / count=3 default result:");
+console.log("Your local UTC hours [7, 9, 11, 13] / count=5 default result:");
 console.log(JSON.stringify(nextAvailableSlots("general_medicine", fromDateIso), null, 2));
 
 console.log("\nWhat the live call actually returned (from the CSV transcript, for comparison):");

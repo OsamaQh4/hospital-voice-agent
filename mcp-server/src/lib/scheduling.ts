@@ -1,4 +1,4 @@
-import type { Department } from "../types";
+import type { Department } from "../../../webhook-function/src/types";
 
 const SLOT_HOURS_UTC = [7, 9, 11, 13];
 const SLOTS_TO_GENERATE = 5;
@@ -15,7 +15,11 @@ export interface AvailableSlot {
   slotTime: string;
 }
 
-export function nextAvailableSlots(department: Department, fromDateIso: string): AvailableSlot[] {
+export function nextAvailableSlots(
+  department: Department,
+  fromDateIso: string,
+  sameDayEnabled: boolean = false
+): AvailableSlot[] {
   const slots: AvailableSlot[] = [];
   const start = new Date(fromDateIso);
   if (Number.isNaN(start.getTime())) {
@@ -23,9 +27,18 @@ export function nextAvailableSlots(department: Department, fromDateIso: string):
   }
 
   const cursor = new Date(Date.UTC(start.getUTCFullYear(), start.getUTCMonth(), start.getUTCDate()));
+  let isFirstDay = true;
 
   while (slots.length < SLOTS_TO_GENERATE) {
-    cursor.setUTCDate(cursor.getUTCDate() + 1);
+    if (!isFirstDay) {
+      cursor.setUTCDate(cursor.getUTCDate() + 1);
+    } else {
+      isFirstDay = false;
+      if (!sameDayEnabled) {
+        cursor.setUTCDate(cursor.getUTCDate() + 1);
+      }
+    }
+
     if (!isBusinessDay(cursor)) continue;
     for (const hour of SLOT_HOURS_UTC) {
       if (slots.length >= SLOTS_TO_GENERATE) break;

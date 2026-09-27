@@ -4,16 +4,18 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run"
   },
   "dependencies": {
+    "@modelcontextprotocol/server": "2.1.0",
     "@telnyx/edge-runtime": "^0.15.3",
-    "@modelcontextprotocol/server": "latest",
     "telnyx": "^7.23.0",
     "zod": "^4.2.0"
   },
   "devDependencies": {
     "@types/node": "^22.10.0",
-    "typescript": "^5.7.0"
+    "typescript": "^5.7.0",
+    "vitest": "^5.0.2"
   }
 }

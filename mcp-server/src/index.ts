@@ -1,23 +1,17 @@
 import { env } from "@telnyx/edge-runtime";
 import { createMcpHandler, McpServer } from "@modelcontextprotocol/server";
 import { z } from "zod";
-import { normalizeSaudiPhone } from "./lib/phone";
-import { log, withTiming } from "./lib/logger";
+import { normalizeSaudiPhone } from "../../webhook-function/src/lib/phone";
+import { log, withTiming } from "../../webhook-function/src/lib/logger";
+import { getDepartmentDirectory, getSameDaySlotsFlag } from "../../webhook-function/src/lib/kv";
 import { nextAvailableSlots } from "./lib/scheduling";
 import { sendSms } from "./lib/telnyxApi";
-import { getDepartmentDirectory } from "./lib/kv";
-import type { PatientProfile } from "./types";
-
-// Shared Actor: PatientActor is owned and shipped by webhook-function.
-// This project only needs its TYPE for `telnyx-edge types` codegen --
-// re-exporting it here (type-only, erased at build time) is what lets
-// `env.PATIENT` resolve to a fully typed ActorNamespace<PatientActor>
-// without this project registering or shipping the class itself.
-export type { PatientActor } from "../../webhook-function/src/actors/patientActor";
+import { patientActorClient } from "./lib/patientActorClient";
+import { handleHealth } from "../../webhook-function/src/lib/health";
 
 const DEPARTMENT_ENUM = z.enum(["general_medicine", "pediatrics", "dental"]);
 
-function jsonResult(data: unknown) {
+function jsonResult(data: object) {
   return {
     content: [{ type: "text" as const, text: JSON.stringify(data) }],
     structuredContent: data as Record<string, unknown>,
@@ -33,6 +27,7 @@ function errorResult(message: string) {
 
 function buildServer(correlationId: string): McpServer {
   const server = new McpServer({ name: "hospital-appointments", version: "1.0.0" });
+  const patients = patientActorClient();
 
   server.registerTool(
     "get_patient_status",
@@ -47,8 +42,7 @@ function buildServer(correlationId: string): McpServer {
     async ({ phone_number }) => {
       return withTiming("mcp.get_patient_status", { correlation_id: correlationId }, async () => {
         const phoneNumber = normalizeSaudiPhone(phone_number);
-        const patient = env.PATIENT.idFromName(phoneNumber);
-        const profile: PatientProfile = await patient.getProfile();
+        const profile = await patients.getProfile(phoneNumber);
         return jsonResult(profile);
       });
     }
@@ -71,7 +65,8 @@ function buildServer(correlationId: string): McpServer {
     async ({ department, from_date }) => {
       return withTiming("mcp.get_available_slots", { correlation_id: correlationId, department }, async () => {
         const fromDateIso = from_date ?? new Date().toISOString();
-        const slots = nextAvailableSlots(department, fromDateIso);
+        const sameDayEnabled = await getSameDaySlotsFlag(env.DEPARTMENT_KV, false);
+        const slots = nextAvailableSlots(department, fromDateIso, sameDayEnabled);
         return jsonResult({ department, slots });
       });
     }
@@ -96,11 +91,10 @@ function buildServer(correlationId: string): McpServer {
         { correlation_id: correlationId, department },
         async () => {
           const phoneNumber = normalizeSaudiPhone(phone_number);
-          const patient = env.PATIENT.idFromName(phoneNumber);
           if (full_name) {
-            await patient.setFullName(full_name);
+            await patients.setFullName(phoneNumber, full_name);
           }
-          const profile = await patient.bookAppointment(department, slot_time);
+          const profile = await patients.bookAppointment(phoneNumber, department, slot_time);
           return jsonResult(profile);
         }
       );
@@ -128,17 +122,16 @@ function buildServer(correlationId: string): McpServer {
         { correlation_id: correlationId, action },
         async () => {
           const phoneNumber = normalizeSaudiPhone(phone_number);
-          const patient = env.PATIENT.idFromName(phoneNumber);
 
           if (action === "cancel") {
-            const profile = await patient.cancelAppointment();
+            const profile = await patients.cancelAppointment(phoneNumber);
             return jsonResult(profile);
           }
 
           if (!new_slot_time) {
             return errorResult("new_slot_time is required when action is 'reschedule'");
           }
-          const profile = await patient.rescheduleAppointment(new_slot_time);
+          const profile = await patients.rescheduleAppointment(phoneNumber, new_slot_time);
           return jsonResult(profile);
         }
       );
@@ -161,8 +154,7 @@ function buildServer(correlationId: string): McpServer {
         { correlation_id: correlationId },
         async () => {
           const phoneNumber = normalizeSaudiPhone(phone_number);
-          const patient = env.PATIENT.idFromName(phoneNumber);
-          const profile: PatientProfile = await patient.getProfile();
+          const profile = await patients.getProfile(phoneNumber);
 
           if (!profile.currentAppointment || profile.currentAppointment.status !== "booked") {
             return errorResult("No booked appointment on file for this patient");
@@ -207,8 +199,7 @@ function buildServer(correlationId: string): McpServer {
     async ({ phone_number }) => {
       return withTiming("mcp.reset_patient_state", { correlation_id: correlationId }, async () => {
         const phoneNumber = normalizeSaudiPhone(phone_number);
-        const patient = env.PATIENT.idFromName(phoneNumber);
-        await patient.reset();
+        await patients.reset(phoneNumber);
         return jsonResult({ reset: true });
       });
     }
@@ -223,5 +214,10 @@ const handler = createMcpHandler((ctx) => {
 });
 
 export default {
-  fetch: (request: Request) => handler.fetch(request),
+  fetch: (request: Request) => {
+    if (new URL(request.url).pathname === "/health") {
+      return handleHealth(request, env, "mcp-server");
+    }
+    return handler.fetch(request);
+  },
 };
