@@ -20,24 +20,7 @@ Built for the Telnyx Forward Deployed Engineer take-home.
 
 ## How it works
 
-```
-  Caller ──► Telnyx AI Assistant  (Kimi K2.6, conversation flow, Telnyx voice)
-                 │                               │
-     at call start: dynamic variables   during the call: MCP tools
-                 │                               │
-                 ▼                               ▼
-      hospital-webhook-v2              hospital-mcp-v2
-      (Edge Function)                  (Edge Function, MCP over HTTP)
-                 │                               │
-                 └───────────────┬───────────────┘
-                                 ▼
-                     Patient records, per phone number
-                     PatientActorV2 (Stateful Actor)
-                     or KV, chosen by PATIENT_BACKEND
-                                 │
-                 DEPARTMENT_KV: department directory, same-day-slots flag
-                 Telnyx Messaging: confirmation SMS
-```
+![Project Screenshot](system-architecture.png)
 
 - **`webhook-function`** (`hospital-webhook-v2`) runs once at call start.
   It verifies the request's Ed25519 signature (`telnyx.webhooks.unwrap`),
